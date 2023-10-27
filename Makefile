@@ -17,7 +17,7 @@ REPO_PATH="github.com/kubeflow/mpi-operator"
 REL_OSARCH="linux/amd64"
 GitSHA=$(shell git rev-parse HEAD)
 Date=$(shell date "+%Y-%m-%d %H:%M:%S")
-RELEASE_VERSION?=v0.4.0
+RELEASE_VERSION?=master
 CONTROLLER_VERSION?=v2
 BASE_IMAGE_SSH_PORT?=2222
 IMG_BUILDER=docker
@@ -45,9 +45,67 @@ VOLCANO_SCHEDULER_VERSION?=$(shell go list -m -f "{{.Version}}" volcano.sh/apis)
 
 CRD_OPTIONS ?= "crd:generateEmbeddedObjectMeta=true"
 
+PROFILE ?= observability
+NAMESPACE ?= mpi-operator
+RELEASE_NAME ?= mpi-operator
+
+define grafana_ip
+$(shell kubectl --context ${PROFILE} get nodes --namespace observability -o jsonpath="{.items[0].status.addresses[0].address}")
+endef
+
+define grafana_port
+$(shell kubectl --context ${PROFILE} get --namespace grafana -o jsonpath="{.spec.ports[0].nodePort}" services grafana)
+endef
+
 build: all
 
 all: ${BIN_DIR} fmt vet tidy lint test mpi-operator.v2
+
+dependencies: dependencies-asdf dependencies-helm
+
+dependencies-asdf:
+	@echo "Updating asdf plugins..."
+	@asdf plugin update --all >/dev/null 2>&1 || true
+	@echo "Adding new asdf plugins..."
+	@cut -d" " -f1 ./.tool-versions | xargs -I % asdf plugin-add % >/dev/null 2>&1 || true
+	@echo "Installing asdf tools..."
+	@cat ./.tool-versions | xargs -I{} bash -c 'asdf install {}'
+	@echo "Updating local environment to use proper tool versions..."
+	@cat ./.tool-versions | xargs -I{} bash -c 'asdf local {}'
+	@asdf reshim
+	@echo "Done!"
+
+dependencies-helm:
+	@helm repo add bitnami https://charts.bitnami.com/bitnami
+	@helm repo add elastic https://helm.elastic.co
+	@helm repo add fluent https://fluent.github.io/helm-charts
+	@helm repo add grafana https://grafana.github.io/helm-charts
+	@helm repo add prometheus https://prometheus-community.github.io/helm-charts
+	@helm repo add sonarqube https://SonarSource.github.io/helm-chart-sonarqube
+
+start-minikube:
+	@minikube -p ${PROFILE} start
+
+stop-minikube:
+	@minikube -p ${PROFILE} stop
+
+delete-minikube:
+	@minikube -p ${PROFILE} delete
+
+.PHONY: deploy
+deploy:
+	@kubectl --context ${PROFILE} -n ${NAMESPACE} apply -f deploy/v2beta1/mpi-operator.yaml
+
+uninstall:
+	@kubectl --context ${PROFILE} -n ${NAMESPACE} delete -f deploy/v2beta1/mpi-operator.yaml
+
+grafana:
+	@echo http://$(call grafana_ip):$(call grafana_port)
+	@python -mwebbrowser http://$(call grafana_ip):$(call grafana_port)
+
+load:
+	@kubectl --context ${PROFILE} -n ${NAMESPACE} delete -f deploy/v2beta1/mpi-operator.yaml || true
+	@minikube -p ${PROFILE} image load ${IMAGE_NAME}:${RELEASE_VERSION}
 
 .PHONY: mpi-operator.v2
 mpi-operator.v2:

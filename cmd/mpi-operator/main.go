@@ -15,15 +15,24 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net/http"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/sdk/resource"
+	tracesdk "go.opentelemetry.io/otel/sdk/trace"
 	"k8s.io/klog"
 
 	"github.com/kubeflow/mpi-operator/cmd/mpi-operator/app"
 	"github.com/kubeflow/mpi-operator/cmd/mpi-operator/app/options"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+const (
+	mpiTracer = "github.com/patrickkenney9801/mpi-operator"
 )
 
 func startMonitoring(monitoringPort int) {
@@ -39,6 +48,17 @@ func startMonitoring(monitoringPort int) {
 	}
 }
 
+func setupTracing(ctx context.Context, collectorEndpoint string, version string) (*tracesdk.TracerProvider, error) {
+	spanExporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithInsecure(), otlptracegrpc.WithEndpoint(collectorEndpoint))
+	if err != nil {
+		return nil, err
+	}
+	traceResource := resource.Default()
+	traceProvider := tracesdk.NewTracerProvider(tracesdk.WithBatcher(spanExporter), tracesdk.WithResource(traceResource), tracesdk.WithSampler(tracesdk.AlwaysSample()))
+	otel.SetTracerProvider(traceProvider)
+	return traceProvider, nil
+}
+
 func main() {
 	klog.InitFlags(nil)
 	s := options.NewServerOption()
@@ -47,8 +67,17 @@ func main() {
 	flag.Parse()
 
 	startMonitoring(s.MonitoringPort)
+	traceProvider, err := setupTracing(context.TODO(), "tempo.tempo:4317", "0.0.1")
+	if err != nil {
+		klog.Error("Tracing setup failure.", err)
+	}
+	ctx, span := otel.GetTracerProvider().Tracer(mpiTracer).Start(context.TODO(), "dummy span")
+	_, span2 := otel.GetTracerProvider().Tracer(mpiTracer).Start(ctx, "dummy child span")
+	span2.End()
+	span.End()
 
 	if err := app.Run(s); err != nil {
 		klog.Fatalf("%v\n", err)
 	}
+	_ = traceProvider.Shutdown(context.TODO())
 }
