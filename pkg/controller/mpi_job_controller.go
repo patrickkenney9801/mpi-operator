@@ -41,6 +41,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	batchinformers "k8s.io/client-go/informers/batch/v1"
@@ -263,6 +264,34 @@ type MPIJobController struct {
 	clock clock.WithTicker
 }
 
+var traces = map[types.UID]trace.SpanContext{}
+
+type WorkItem struct {
+	mpijob string
+	span   trace.Span
+}
+
+func GetTracer() trace.Tracer {
+	return otel.GetTracerProvider().Tracer(mpiTracer)
+}
+func EndSpan(span trace.Span, err *error) {
+	if err != nil {
+		span.RecordError(*err)
+	}
+	span.End()
+}
+func GetRequestSpan(uid types.UID, key string, spanName string, spanOptions trace.SpanStartEventOption) (context.Context, trace.Span) {
+	spanCtx, ok := traces[uid]
+	if !ok {
+		ctx, span := GetTracer().Start(context.TODO(), "root handler", trace.WithAttributes(attribute.String("resource", key), attribute.String("resource_uid", string(uid))))
+		defer span.End()
+		spanCtx = trace.SpanContextFromContext(ctx)
+		traces[uid] = spanCtx
+	}
+	ctx := trace.ContextWithSpanContext(context.TODO(), spanCtx)
+	return GetTracer().Start(ctx, spanName, spanOptions)
+}
+
 // NewMPIJobController returns a new MPIJob controller.
 func NewMPIJobController(
 	kubeClient kubernetes.Interface,
@@ -355,7 +384,16 @@ func NewMPIJobControllerWithClock(
 	if _, err := mpiJobInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.addMPIJob,
 		UpdateFunc: func(old, new interface{}) {
-			controller.enqueueMPIJob(new)
+			var key string
+			var err error
+			if key, err = cache.MetaNamespaceKeyFunc(new); err != nil {
+				runtime.HandleError(err)
+				return
+			}
+
+			mpiJob := new.(*kubeflow.MPIJob)
+			_, span := GetRequestSpan(mpiJob.GetUID(), key, "update mpijob", trace.WithAttributes(attribute.String("altered_object", mpiJob.GetName()), attribute.String("altered_object_uid", string(mpiJob.GetUID()))))
+			controller.enqueueMPIJob(WorkItem{key, span})
 		},
 	}); err != nil {
 		return nil, err
@@ -488,14 +526,20 @@ func (c *MPIJobController) processNextWorkItem() bool {
 		// put back on the work queue and attempted again after a back-off
 		// period.
 		defer c.queue.Done(obj)
+		var work WorkItem
 		var key string
+		var span trace.Span
 		var ok bool
 		// We expect strings to come off the work queue. These are of the
 		// form namespace/name. We do this as the delayed nature of the
 		// work queue means the items in the informer cache may actually be
 		// more up to date that when the item was initially put onto the
 		// work queue.
-		if key, ok = obj.(string); !ok {
+		work, ok = obj.(WorkItem)
+		key = work.mpijob
+		span = work.span
+		defer span.End()
+		if !ok {
 			// As the item in the work queue is actually invalid, we call
 			// Forget here else we'd go into a loop of attempting to
 			// process a work item that is invalid.
@@ -503,10 +547,15 @@ func (c *MPIJobController) processNextWorkItem() bool {
 			runtime.HandleError(fmt.Errorf("expected string in workqueue but got %#v", obj))
 			return nil
 		}
+		ctx := trace.ContextWithSpan(context.TODO(), span)
 		// Run the syncHandler, passing it the namespace/name string of the
 		// MPIJob resource to be synced.
-		if err := c.syncHandler(key); err != nil {
-			c.queue.AddRateLimited(key)
+		if err := c.syncHandler(ctx, key, span); err != nil {
+			_, retrySpan := GetTracer().Start(ctx, "retry sync handler")
+			c.queue.AddRateLimited(WorkItem{
+				key,
+				retrySpan,
+			})
 			return fmt.Errorf("error syncing '%s': %s", key, err.Error())
 		}
 		// Finally, if no error occurs we Forget this item so it does not
@@ -524,37 +573,15 @@ func (c *MPIJobController) processNextWorkItem() bool {
 	return true
 }
 
-func GetTracer() trace.Tracer {
-	return otel.GetTracerProvider().Tracer(mpiTracer)
-}
-func EndSpan(span trace.Span, err *error) {
-	if err != nil {
-		span.RecordError(*err)
-	}
-	span.End()
-}
-
-var traces = map[string]trace.SpanContext{}
-
 // syncHandler compares the actual state with the desired, and attempts to
 // converge the two. It then updates the Status block of the MPIJob resource
 // with the current status of the resource.
-func (c *MPIJobController) syncHandler(key string) (err error) {
+func (c *MPIJobController) syncHandler(ctx context.Context, key string, span trace.Span) (err error) {
 	startTime := c.clock.Now()
 	defer func() {
 		klog.Infof("Finished syncing job %q (%v)", key, c.clock.Since(startTime))
 	}()
-
-	spanCtx, ok := traces[key]
-	if !ok {
-		ctx, span := GetTracer().Start(context.TODO(), "root sync handler", trace.WithAttributes(attribute.String("resource", key)))
-		defer EndSpan(span, &err)
-		spanCtx = trace.SpanContextFromContext(ctx)
-		traces[key] = spanCtx
-	}
-	ctx := trace.ContextWithSpanContext(context.TODO(), spanCtx)
-	ctx, span := GetTracer().Start(ctx, "sync handler")
-	defer EndSpan(span, &err)
+	span.AddEvent("entering sync handler")
 
 	// Convert the namespace/name string into a distinct namespace and name.
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
@@ -1219,20 +1246,19 @@ func (c *MPIJobController) addMPIJob(obj interface{}) {
 
 	// Set default for the new mpiJob.
 	scheme.Scheme.Default(mpiJob)
-	c.enqueueMPIJob(mpiJob)
-}
-
-// enqueueMPIJob takes a MPIJob resource and converts it into a namespace/name
-// string which is then put onto the work queue. This method should *not* be
-// passed resources of any type other than MPIJob.
-func (c *MPIJobController) enqueueMPIJob(obj interface{}) {
 	var key string
 	var err error
-	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
+	if key, err = cache.MetaNamespaceKeyFunc(mpiJob); err != nil {
 		runtime.HandleError(err)
 		return
 	}
-	c.queue.AddRateLimited(key)
+	_, span := GetRequestSpan(mpiJob.GetUID(), key, "add mpijob", trace.WithAttributes(attribute.String("altered_object", mpiJob.GetName()), attribute.String("altered_object_uid", string(mpiJob.GetUID()))))
+	c.enqueueMPIJob(WorkItem{key, span})
+}
+
+// enqueueMPIJob takes a namespace/name tuple combined with a SpanCtx
+func (c *MPIJobController) enqueueMPIJob(work WorkItem) {
+	c.queue.AddRateLimited(work)
 }
 
 // handleObject will take any resource implementing metav1.Object and attempt
@@ -1288,8 +1314,17 @@ func (c *MPIJobController) handleObject(obj interface{}) {
 		klog.V(4).Infof("ignoring orphaned object '%s' of mpi job '%s'", object.GetSelfLink(), ownerRef.Name)
 		return
 	}
+	var key string
+	if key, err = cache.MetaNamespaceKeyFunc(mpiJob); err != nil {
+		runtime.HandleError(err)
+		return
+	}
+	_, span := GetRequestSpan(mpiJob.GetUID(), key, "handle object", trace.WithAttributes(attribute.String("altered_object", object.GetName()), attribute.String("altered_object_uid", string(object.GetUID()))))
 
-	c.enqueueMPIJob(mpiJob)
+	c.enqueueMPIJob(WorkItem{
+		key,
+		span,
+	})
 }
 
 func (c *MPIJobController) handleObjectUpdate(old, new interface{}) {

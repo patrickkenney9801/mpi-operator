@@ -23,7 +23,7 @@ spec:
             args:
             - -n
             - "2"
-            - "sleep 10"
+            - "date"
             resources:
               limits:
                 cpu: 1
