@@ -24,6 +24,7 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/sdk/resource"
 	tracesdk "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.10.0"
 	"k8s.io/klog"
 
 	"github.com/kubeflow/mpi-operator/cmd/mpi-operator/app"
@@ -32,7 +33,8 @@ import (
 )
 
 const (
-	mpiTracer = "github.com/patrickkenney9801/mpi-operator"
+	mpiServiceName = "mpi-operator"
+	mpiTracer      = "github.com/patrickkenney9801/mpi-operator"
 )
 
 func startMonitoring(monitoringPort int) {
@@ -53,7 +55,12 @@ func setupTracing(ctx context.Context, collectorEndpoint string, version string)
 	if err != nil {
 		return nil, err
 	}
-	traceResource := resource.Default()
+	traceResource :=
+		resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String(mpiServiceName),
+			semconv.ServiceVersionKey.String(version),
+		)
 	traceProvider := tracesdk.NewTracerProvider(tracesdk.WithBatcher(spanExporter), tracesdk.WithResource(traceResource), tracesdk.WithSampler(tracesdk.AlwaysSample()))
 	otel.SetTracerProvider(traceProvider)
 	return traceProvider, nil
@@ -71,10 +78,6 @@ func main() {
 	if err != nil {
 		klog.Error("Tracing setup failure.", err)
 	}
-	ctx, span := otel.GetTracerProvider().Tracer(mpiTracer).Start(context.TODO(), "dummy span")
-	_, span2 := otel.GetTracerProvider().Tracer(mpiTracer).Start(ctx, "dummy child span")
-	span2.End()
-	span.End()
 
 	if err := app.Run(s); err != nil {
 		klog.Fatalf("%v\n", err)
