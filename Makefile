@@ -107,6 +107,11 @@ load:
 	@kubectl --context ${PROFILE} -n ${NAMESPACE} delete -f deploy/v2beta1/mpi-operator.yaml || true
 	@minikube -p ${PROFILE} image load ${IMAGE_NAME}:${RELEASE_VERSION}
 
+test-k8s:
+	@date
+	@kubectl --context ${PROFILE} --namespace mpi-operator delete mpijob pi || true
+	@kubectl --context ${PROFILE} --namespace mpi-operator apply -f test/mpirun.yaml
+
 .PHONY: mpi-operator.v2
 mpi-operator.v2:
 	go build -ldflags ${LD_FLAGS_V2} -o ${BIN_DIR}/mpi-operator.v2 ./cmd/mpi-operator/

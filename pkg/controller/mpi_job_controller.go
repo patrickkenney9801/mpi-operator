@@ -30,6 +30,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/crypto/ssh"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -87,6 +90,7 @@ const (
 	sshPrivateKeyFile       = "id_rsa"
 	sshPublicKeyFile        = sshPrivateKeyFile + ".pub"
 	sshAuthorizedKeysFile   = "authorized_keys"
+	mpiTracer               = "github.com/patrickkenney9801/mpi-operator"
 )
 
 const (
@@ -520,19 +524,43 @@ func (c *MPIJobController) processNextWorkItem() bool {
 	return true
 }
 
+func GetTracer() trace.Tracer {
+	return otel.GetTracerProvider().Tracer(mpiTracer)
+}
+func EndSpan(span trace.Span, err *error) {
+	if err != nil {
+		span.RecordError(*err)
+	}
+	span.End()
+}
+
+var traces = map[string]trace.SpanContext{}
+
 // syncHandler compares the actual state with the desired, and attempts to
 // converge the two. It then updates the Status block of the MPIJob resource
 // with the current status of the resource.
-func (c *MPIJobController) syncHandler(key string) error {
+func (c *MPIJobController) syncHandler(key string) (err error) {
 	startTime := c.clock.Now()
 	defer func() {
 		klog.Infof("Finished syncing job %q (%v)", key, c.clock.Since(startTime))
 	}()
 
+	spanCtx, ok := traces[key]
+	if !ok {
+		ctx, span := GetTracer().Start(context.TODO(), "root sync handler", trace.WithAttributes(attribute.String("resource", key)))
+		defer EndSpan(span, &err)
+		spanCtx = trace.SpanContextFromContext(ctx)
+		traces[key] = spanCtx
+	}
+	ctx := trace.ContextWithSpanContext(context.TODO(), spanCtx)
+	ctx, span := GetTracer().Start(ctx, "sync handler")
+	defer EndSpan(span, &err)
+
 	// Convert the namespace/name string into a distinct namespace and name.
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		runtime.HandleError(fmt.Errorf("invalid resource key: %s", key))
+		span.AddEvent("invalid resource key")
 		return nil
 	}
 
@@ -542,9 +570,11 @@ func (c *MPIJobController) syncHandler(key string) error {
 		// The MPIJob may no longer exist, in which case we stop processing.
 		if errors.IsNotFound(err) {
 			klog.V(4).Infof("MPIJob has been deleted: %v", key)
+			span.AddEvent("mpijob has been deleted")
 			return nil
 		}
-		return fmt.Errorf("obtaining job: %w", err)
+		err = fmt.Errorf("obtaining job: %w", err)
+		return err
 	}
 
 	// NEVER modify objects from the store. It's a read-only, local cache.
@@ -556,12 +586,14 @@ func (c *MPIJobController) syncHandler(key string) error {
 
 	// for mpi job that is terminating, just return.
 	if mpiJob.DeletionTimestamp != nil {
+		span.AddEvent("mpijob terminating")
 		return nil
 	}
 
 	if errs := validation.ValidateMPIJob(mpiJob); len(errs) != 0 {
 		msg := truncateMessage(fmt.Sprintf("Found validation errors: %v", errs.ToAggregate()))
 		c.recorder.Event(mpiJob, corev1.EventTypeWarning, ValidationError, msg)
+		span.RecordError(errs[0])
 		// Do not requeue
 		return nil
 	}
@@ -571,6 +603,7 @@ func (c *MPIJobController) syncHandler(key string) error {
 		updateMPIJobConditions(mpiJob, kubeflow.JobCreated, corev1.ConditionTrue, mpiJobCreatedReason, msg)
 		c.recorder.Event(mpiJob, corev1.EventTypeNormal, "MPIJobCreated", msg)
 		mpiJobsCreatedCount.Inc()
+		span.AddEvent("mpijob created")
 	}
 
 	// CompletionTime is only filled when the launcher Job succeeded or stopped
@@ -578,6 +611,7 @@ func (c *MPIJobController) syncHandler(key string) error {
 	// cleanup and stop retrying the MPIJob.
 	if isFinished(mpiJob.Status) && mpiJob.Status.CompletionTime != nil {
 		if isCleanUpPods(mpiJob.Spec.RunPolicy.CleanPodPolicy) {
+			span.AddEvent("mpijob cleaning up worker pods")
 			if err := cleanUpWorkerPods(mpiJob, c); err != nil {
 				return err
 			}
@@ -590,6 +624,7 @@ func (c *MPIJobController) syncHandler(key string) error {
 	if mpiJob.Status.StartTime == nil && !isMPIJobSuspended(mpiJob) {
 		now := metav1.Now()
 		mpiJob.Status.StartTime = &now
+		span.AddEvent("mpijob setting StartTime")
 	}
 
 	// Get the launcher Job for this MPIJob.
@@ -602,28 +637,33 @@ func (c *MPIJobController) syncHandler(key string) error {
 	// We're done if the launcher either succeeded or failed.
 	done := launcher != nil && isJobFinished(launcher)
 	if !done {
-		_, err := c.getOrCreateService(mpiJob, newWorkersService(mpiJob))
+		span.SetAttributes(attribute.Bool("done", false))
+		_, err := c.getOrCreateService(ctx, mpiJob, newWorkersService(mpiJob))
 		if err != nil {
-			return fmt.Errorf("getting or creating Service to front workers: %w", err)
+			err = fmt.Errorf("getting or creating Service to front workers: %w", err)
+			return err
 		}
 
-		if config, err := c.getOrCreateConfigMap(mpiJob); config == nil || err != nil {
-			return fmt.Errorf("getting or creating ConfigMap: %w", err)
+		if config, err := c.getOrCreateConfigMap(ctx, mpiJob); config == nil || err != nil {
+			err = fmt.Errorf("getting or creating ConfigMap: %w", err)
+			return err
 		}
 
-		_, err = c.getOrCreateSSHAuthSecret(mpiJob)
+		_, err = c.getOrCreateSSHAuthSecret(ctx, mpiJob)
 		if err != nil {
-			return fmt.Errorf("creating SSH auth secret: %w", err)
+			err = fmt.Errorf("creating SSH auth secret: %w", err)
+			return err
 		}
 
 		if !isMPIJobSuspended(mpiJob) {
+			span.SetAttributes(attribute.Bool("suspended", false))
 			// Get the PodGroup for this MPIJob
 			if c.PodGroupCtrl != nil {
-				if podGroup, err := c.getOrCreatePodGroups(mpiJob); podGroup == nil || err != nil {
+				if podGroup, err := c.getOrCreatePodGroups(ctx, mpiJob); podGroup == nil || err != nil {
 					return err
 				}
 			}
-			worker, err = c.getOrCreateWorker(mpiJob)
+			worker, err = c.getOrCreateWorker(ctx, mpiJob)
 			if err != nil {
 				return err
 			}
@@ -633,19 +673,23 @@ func (c *MPIJobController) syncHandler(key string) error {
 			// The Intel and MPICH implementations require workers to communicate with the
 			// launcher through its hostname. For that, we create a Service which
 			// has the same name as the launcher's hostname.
-			_, err := c.getOrCreateService(mpiJob, newLauncherService(mpiJob))
+			_, err := c.getOrCreateService(ctx, mpiJob, newLauncherService(mpiJob))
 			if err != nil {
-				return fmt.Errorf("getting or creating Service to front launcher: %w", err)
+				err = fmt.Errorf("getting or creating Service to front launcher: %w", err)
+				return err
 			}
 		}
 		if launcher == nil {
+			span.AddEvent("mpijob launcher is nil")
 			if mpiJob.Spec.LauncherCreationPolicy == kubeflow.LauncherCreationPolicyAtStartup || c.countReadyWorkerPods(worker) == len(worker) {
 				launcher, err = c.kubeClient.BatchV1().Jobs(namespace).Create(context.TODO(), c.newLauncherJob(mpiJob), metav1.CreateOptions{})
 				if err != nil {
 					c.recorder.Eventf(mpiJob, corev1.EventTypeWarning, mpiJobFailedReason, "launcher pod created failed: %v", err)
-					return fmt.Errorf("creating launcher Pod: %w", err)
+					err = fmt.Errorf("creating launcher Pod: %w", err)
+					return err
 				}
 			} else {
+				span.AddEvent("waiting for workers to start")
 				klog.V(4).Infof("Waiting for workers %s/%s to start.", mpiJob.Namespace, mpiJob.Name)
 			}
 		}
@@ -653,6 +697,7 @@ func (c *MPIJobController) syncHandler(key string) error {
 
 	if launcher != nil {
 		if isMPIJobSuspended(mpiJob) != isJobSuspended(launcher) {
+			span.AddEvent("mpijob update suspended state")
 			// align the suspension state of launcher with the MPIJob
 			launcher.Spec.Suspend = pointer.Bool(isMPIJobSuspended(mpiJob))
 			if _, err := c.kubeClient.BatchV1().Jobs(namespace).Update(context.TODO(), launcher, metav1.UpdateOptions{}); err != nil {
@@ -663,6 +708,7 @@ func (c *MPIJobController) syncHandler(key string) error {
 
 	// cleanup the running worker pods if the MPI job is suspended
 	if isMPIJobSuspended(mpiJob) {
+		span.AddEvent("mpijob clean up worker pods")
 		if err := cleanUpWorkerPods(mpiJob, c); err != nil {
 			return err
 		}
@@ -670,6 +716,7 @@ func (c *MPIJobController) syncHandler(key string) error {
 
 	// Finally, we update the status block of the MPIJob resource to reflect the
 	// current state of the world.
+	span.SetAttributes(attribute.Bool("update_job_status", true))
 	err = c.updateMPIJobStatus(mpiJob, launcher, worker)
 	if err != nil {
 		return err
@@ -717,12 +764,14 @@ func (c *MPIJobController) getLauncherJob(mpiJob *kubeflow.MPIJob) (*batchv1.Job
 }
 
 // getOrCreatePodGroups will create a PodGroup for gang scheduling by volcano.
-func (c *MPIJobController) getOrCreatePodGroups(mpiJob *kubeflow.MPIJob) (metav1.Object, error) {
+func (c *MPIJobController) getOrCreatePodGroups(ctx context.Context, mpiJob *kubeflow.MPIJob) (metav1.Object, error) {
 	newPodGroup := c.PodGroupCtrl.newPodGroup(mpiJob)
 	podGroup, err := c.PodGroupCtrl.getPodGroup(newPodGroup.GetNamespace(), newPodGroup.GetName())
 	// If the PodGroup doesn't exist, we'll create it.
 	if errors.IsNotFound(err) {
-		return c.PodGroupCtrl.createPodGroup(context.TODO(), newPodGroup)
+		ctx, span := GetTracer().Start(ctx, "create pod group")
+		defer span.End()
+		return c.PodGroupCtrl.createPodGroup(ctx, newPodGroup)
 	}
 	// If an error occurs during Get/Create, we'll requeue the item so we
 	// can attempt processing again later. This could have been caused by a
@@ -739,7 +788,9 @@ func (c *MPIJobController) getOrCreatePodGroups(mpiJob *kubeflow.MPIJob) (metav1
 	}
 
 	if !c.PodGroupCtrl.pgSpecsAreEqual(podGroup, newPodGroup) {
-		return c.PodGroupCtrl.updatePodGroup(context.TODO(), podGroup, newPodGroup)
+		ctx, span := GetTracer().Start(ctx, "update pod group")
+		defer span.End()
+		return c.PodGroupCtrl.updatePodGroup(ctx, podGroup, newPodGroup)
 	}
 	return podGroup, nil
 }
@@ -810,7 +861,7 @@ func (c *MPIJobController) countReadyWorkerPods(workers []*corev1.Pod) int {
 
 // getOrCreateConfigMap gets the ConfigMap controlled by this MPIJob, or creates
 // one if it doesn't exist.
-func (c *MPIJobController) getOrCreateConfigMap(mpiJob *kubeflow.MPIJob) (*corev1.ConfigMap, error) {
+func (c *MPIJobController) getOrCreateConfigMap(ctx context.Context, mpiJob *kubeflow.MPIJob) (*corev1.ConfigMap, error) {
 	newCM := newConfigMap(mpiJob, workerReplicas(mpiJob))
 	podList, err := c.getRunningWorkerPods(mpiJob)
 	if err != nil {
@@ -821,7 +872,9 @@ func (c *MPIJobController) getOrCreateConfigMap(mpiJob *kubeflow.MPIJob) (*corev
 	cm, err := c.configMapLister.ConfigMaps(mpiJob.Namespace).Get(mpiJob.Name + configSuffix)
 	// If the ConfigMap doesn't exist, we'll create it.
 	if errors.IsNotFound(err) {
-		return c.kubeClient.CoreV1().ConfigMaps(mpiJob.Namespace).Create(context.TODO(), newCM, metav1.CreateOptions{})
+		ctx, span := GetTracer().Start(ctx, "create config map")
+		defer span.End()
+		return c.kubeClient.CoreV1().ConfigMaps(mpiJob.Namespace).Create(ctx, newCM, metav1.CreateOptions{})
 	}
 	if err != nil {
 		return nil, err
@@ -837,9 +890,11 @@ func (c *MPIJobController) getOrCreateConfigMap(mpiJob *kubeflow.MPIJob) (*corev
 
 	// If the ConfigMap is changed, update it
 	if !equality.Semantic.DeepEqual(cm.Data, newCM.Data) {
+		ctx, span := GetTracer().Start(ctx, "update config map")
+		defer span.End()
 		cm = cm.DeepCopy()
 		cm.Data = newCM.Data
-		cm, err = c.kubeClient.CoreV1().ConfigMaps(mpiJob.Namespace).Update(context.TODO(), cm, metav1.UpdateOptions{})
+		cm, err = c.kubeClient.CoreV1().ConfigMaps(mpiJob.Namespace).Update(ctx, cm, metav1.UpdateOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -848,10 +903,12 @@ func (c *MPIJobController) getOrCreateConfigMap(mpiJob *kubeflow.MPIJob) (*corev
 	return cm, nil
 }
 
-func (c *MPIJobController) getOrCreateService(job *kubeflow.MPIJob, newSvc *corev1.Service) (*corev1.Service, error) {
+func (c *MPIJobController) getOrCreateService(ctx context.Context, job *kubeflow.MPIJob, newSvc *corev1.Service) (*corev1.Service, error) {
 	svc, err := c.serviceLister.Services(job.Namespace).Get(newSvc.Name)
 	if errors.IsNotFound(err) {
-		return c.kubeClient.CoreV1().Services(job.Namespace).Create(context.TODO(), newSvc, metav1.CreateOptions{})
+		ctx, span := GetTracer().Start(ctx, "create service")
+		defer span.End()
+		return c.kubeClient.CoreV1().Services(job.Namespace).Create(ctx, newSvc, metav1.CreateOptions{})
 	}
 	if err != nil {
 		return nil, err
@@ -866,7 +923,8 @@ func (c *MPIJobController) getOrCreateService(job *kubeflow.MPIJob, newSvc *core
 	if !equality.Semantic.DeepEqual(svc.Spec.Selector, newSvc.Spec.Selector) {
 		svc = svc.DeepCopy()
 		svc.Spec.Selector = newSvc.Spec.Selector
-		return c.kubeClient.CoreV1().Services(svc.Namespace).Update(context.TODO(), svc, metav1.UpdateOptions{})
+		trace.SpanFromContext(ctx).AddEvent("mpijob updating service selector")
+		return c.kubeClient.CoreV1().Services(svc.Namespace).Update(ctx, svc, metav1.UpdateOptions{})
 	}
 
 	return svc, nil
@@ -874,14 +932,16 @@ func (c *MPIJobController) getOrCreateService(job *kubeflow.MPIJob, newSvc *core
 
 // getOrCreateSSHAuthSecret gets the Secret holding the SSH auth for this job,
 // or create one if it doesn't exist.
-func (c *MPIJobController) getOrCreateSSHAuthSecret(job *kubeflow.MPIJob) (*corev1.Secret, error) {
+func (c *MPIJobController) getOrCreateSSHAuthSecret(ctx context.Context, job *kubeflow.MPIJob) (*corev1.Secret, error) {
 	secret, err := c.secretLister.Secrets(job.Namespace).Get(job.Name + sshAuthSecretSuffix)
 	if errors.IsNotFound(err) {
+		ctx, span := GetTracer().Start(ctx, "create ssh secret")
+		defer span.End()
 		secret, err := newSSHAuthSecret(job)
 		if err != nil {
 			return nil, err
 		}
-		return c.kubeClient.CoreV1().Secrets(job.Namespace).Create(context.TODO(), secret, metav1.CreateOptions{})
+		return c.kubeClient.CoreV1().Secrets(job.Namespace).Create(ctx, secret, metav1.CreateOptions{})
 	}
 	if err != nil {
 		return nil, err
@@ -898,9 +958,11 @@ func (c *MPIJobController) getOrCreateSSHAuthSecret(job *kubeflow.MPIJob) (*core
 	hasKeys := keysFromData(secret.Data)
 	wantKeys := keysFromData(newSecret.Data)
 	if !equality.Semantic.DeepEqual(hasKeys, wantKeys) {
+		ctx, span := GetTracer().Start(ctx, "update ssh secret")
+		defer span.End()
 		secret := secret.DeepCopy()
 		secret.Data = newSecret.Data
-		return c.kubeClient.CoreV1().Secrets(secret.Namespace).Update(context.TODO(), secret, metav1.UpdateOptions{})
+		return c.kubeClient.CoreV1().Secrets(secret.Namespace).Update(ctx, secret, metav1.UpdateOptions{})
 	}
 	return secret, nil
 }
@@ -916,7 +978,7 @@ func keysFromData(data map[string][]byte) []string {
 
 // getOrCreateWorkerStatefulSet gets the worker Pod controlled by this
 // MPIJob, or creates one if it doesn't exist.
-func (c *MPIJobController) getOrCreateWorker(mpiJob *kubeflow.MPIJob) ([]*corev1.Pod, error) {
+func (c *MPIJobController) getOrCreateWorker(ctx context.Context, mpiJob *kubeflow.MPIJob) ([]*corev1.Pod, error) {
 	var workerPods []*corev1.Pod
 	worker := mpiJob.Spec.MPIReplicaSpecs[kubeflow.MPIReplicaTypeWorker]
 	if worker == nil {
@@ -941,7 +1003,7 @@ func (c *MPIJobController) getOrCreateWorker(mpiJob *kubeflow.MPIJob) ([]*corev1
 			index, err := strconv.Atoi(indexStr)
 			if err == nil {
 				if index >= int(*worker.Replicas) {
-					err = c.kubeClient.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
+					err = c.kubeClient.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
 					if err != nil {
 						return nil, err
 					}
@@ -955,8 +1017,10 @@ func (c *MPIJobController) getOrCreateWorker(mpiJob *kubeflow.MPIJob) ([]*corev1
 
 		// If the worker Pod doesn't exist, we'll create it.
 		if errors.IsNotFound(err) {
+			ctx, span := GetTracer().Start(ctx, "create worker pod")
+			defer span.End()
 			worker := c.newWorker(mpiJob, i)
-			pod, err = c.kubeClient.CoreV1().Pods(mpiJob.Namespace).Create(context.TODO(), worker, metav1.CreateOptions{})
+			pod, err = c.kubeClient.CoreV1().Pods(mpiJob.Namespace).Create(ctx, worker, metav1.CreateOptions{})
 		}
 		// If an error occurs during Get/Create, we'll requeue the item so we
 		// can attempt processing again later. This could have been caused by a

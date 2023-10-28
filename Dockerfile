@@ -2,13 +2,17 @@
 # REF: https://github.com/GoogleContainerTools/distroless/issues/1342
 FROM golang:1.20-bullseye AS build
 
+# Install go modules early so they are cached
+WORKDIR /go/src/github.com/kubeflow/mpi-operator
+COPY go.mod go.sum /go/src/github.com/kubeflow/mpi-operator/
+RUN go mod download
+
 # Set mpi-operator version
 # Defaults to v2
 ARG VERSION=v2
 ARG RELEASE_VERSION
 
 ADD . /go/src/github.com/kubeflow/mpi-operator
-WORKDIR /go/src/github.com/kubeflow/mpi-operator
 RUN make RELEASE_VERSION=${RELEASE_VERSION} mpi-operator.$VERSION
 RUN ln -s mpi-operator.${VERSION} _output/cmd/bin/mpi-operator
 
