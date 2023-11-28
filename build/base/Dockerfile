@@ -1,4 +1,4 @@
-FROM debian:bullseye
+FROM ubuntu:22.04
 
 ARG port=2222
 
@@ -23,9 +23,11 @@ RUN sed -i "s/[ #]\(.*StrictHostKeyChecking \).*/ \1no/g" /etc/ssh/ssh_config \
     && sed -i "s/[ #]\(.*Port \).*/ \1$port/g" /etc/ssh/ssh_config \
     && sed -i "s/#\(StrictModes \).*/\1no/g" /etc/ssh/sshd_config \
     && sed -i "s/#\(Port \).*/\1$port/g" /etc/ssh/sshd_config
+RUN echo "ConnectTimeout 3" >> /etc/ssh/ssh_config
 
 RUN useradd -m mpiuser
 WORKDIR /home/mpiuser
 # Configurations for running sshd as non-root.
 COPY --chown=mpiuser sshd_config .sshd_config
 RUN echo "Port $port" >> /home/mpiuser/.sshd_config
+RUN echo "ConnectTimeout 3" >> /home/mpiuser/.ssh_config

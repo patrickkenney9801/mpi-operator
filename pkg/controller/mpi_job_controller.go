@@ -192,6 +192,10 @@ var (
 			Value: fmt.Sprintf("%s/%s", configMountPath, hostfileName),
 		},
 		{
+			Name:  "PRTE_MCA_orte_default_hostfile",
+			Value: fmt.Sprintf("%s/%s", configMountPath, hostfileName),
+		},
+		{
 			Name:  "OMPI_MCA_plm_rsh_args",
 			Value: "-o ConnectionAttempts=10",
 		},
@@ -709,7 +713,7 @@ func (c *MPIJobController) syncHandler(ctx context.Context, key string, span tra
 		if launcher == nil {
 			span.AddEvent("mpijob launcher is nil")
 			if mpiJob.Spec.LauncherCreationPolicy == kubeflow.LauncherCreationPolicyAtStartup || c.countReadyWorkerPods(worker) == len(worker) {
-				launcher, err = c.kubeClient.BatchV1().Jobs(namespace).Create(context.TODO(), c.newLauncherJob(mpiJob), metav1.CreateOptions{})
+				launcher, err = c.kubeClient.BatchV1().Jobs(namespace).Create(context.TODO(), c.newLauncherJob(ctx, mpiJob), metav1.CreateOptions{})
 				if err != nil {
 					c.recorder.Eventf(mpiJob, corev1.EventTypeWarning, mpiJobFailedReason, "launcher pod created failed: %v", err)
 					err = fmt.Errorf("creating launcher Pod: %w", err)
@@ -1521,7 +1525,7 @@ func (c *MPIJobController) newWorker(mpiJob *kubeflow.MPIJob, index int) *corev1
 	}
 }
 
-func (c *MPIJobController) newLauncherJob(mpiJob *kubeflow.MPIJob) *batchv1.Job {
+func (c *MPIJobController) newLauncherJob(ctx context.Context, mpiJob *kubeflow.MPIJob) *batchv1.Job {
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      mpiJob.Name + launcherSuffix,
@@ -1537,7 +1541,7 @@ func (c *MPIJobController) newLauncherJob(mpiJob *kubeflow.MPIJob) *batchv1.Job 
 			TTLSecondsAfterFinished: mpiJob.Spec.RunPolicy.TTLSecondsAfterFinished,
 			ActiveDeadlineSeconds:   mpiJob.Spec.RunPolicy.ActiveDeadlineSeconds,
 			BackoffLimit:            mpiJob.Spec.RunPolicy.BackoffLimit,
-			Template:                c.newLauncherPodTemplate(mpiJob),
+			Template:                c.newLauncherPodTemplate(ctx, mpiJob),
 		},
 	}
 	if isMPIJobSuspended(mpiJob) {
@@ -1549,7 +1553,7 @@ func (c *MPIJobController) newLauncherJob(mpiJob *kubeflow.MPIJob) *batchv1.Job 
 // newLauncherPodTemplate creates a new launcher Job for an MPIJob resource. It also sets
 // the appropriate OwnerReferences on the resource so handleObject can discover
 // the MPIJob resource that 'owns' it.
-func (c *MPIJobController) newLauncherPodTemplate(mpiJob *kubeflow.MPIJob) corev1.PodTemplateSpec {
+func (c *MPIJobController) newLauncherPodTemplate(ctx context.Context, mpiJob *kubeflow.MPIJob) corev1.PodTemplateSpec {
 	launcherName := mpiJob.Name + launcherSuffix
 
 	podTemplate := mpiJob.Spec.MPIReplicaSpecs[kubeflow.MPIReplicaTypeLauncher].Template.DeepCopy()
@@ -1596,6 +1600,7 @@ func (c *MPIJobController) newLauncherPodTemplate(mpiJob *kubeflow.MPIJob) corev
 		// be mistakenly using GPU resources for launcher due to potential
 		// issues with scheduler/container technologies.
 		nvidiaDisableEnvVars...)
+	container.Env = append(container.Env, corev1.EnvVar{Name: "TRACESTATE", Value: trace.SpanFromContext(ctx).SpanContext().TraceState().String()})
 	c.setupSSHOnPod(&podTemplate.Spec, mpiJob)
 
 	// Submit a warning event if the user specifies restart policy for

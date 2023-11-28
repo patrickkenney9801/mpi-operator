@@ -84,7 +84,9 @@ dependencies-helm:
 	@helm repo add sonarqube https://SonarSource.github.io/helm-chart-sonarqube
 
 start-minikube:
-	@minikube -p ${PROFILE} start
+	@minikube -p ${PROFILE} start \
+	--extra-config=kubelet.cpu-manager-policy=static \
+	--extra-config=kubelet.reserved-cpus=1
 
 stop-minikube:
 	@minikube -p ${PROFILE} stop
@@ -92,9 +94,19 @@ stop-minikube:
 delete-minikube:
 	@minikube -p ${PROFILE} delete
 
+start-kind:
+	@kind create cluster --name ${PROFILE} \
+	--config test/kind-config.yaml
+
+delete-kind:
+	@kind delete cluster --name ${PROFILE}
+
 .PHONY: deploy
 deploy:
 	@kubectl --context ${PROFILE} -n ${NAMESPACE} apply -f deploy/v2beta1/mpi-operator.yaml
+
+deploy-kind:
+	@kubectl --context kind-${PROFILE} -n ${NAMESPACE} apply -f deploy/v2beta1/mpi-operator.yaml
 
 uninstall:
 	@kubectl --context ${PROFILE} -n ${NAMESPACE} delete -f deploy/v2beta1/mpi-operator.yaml
@@ -103,9 +115,16 @@ grafana:
 	@echo http://$(call grafana_ip):$(call grafana_port)
 	@python -mwebbrowser http://$(call grafana_ip):$(call grafana_port)
 
+load-test:
+	@minikube -p ${PROFILE} image load openmpi:ubuntu
+
 load:
 	@kubectl --context ${PROFILE} -n ${NAMESPACE} delete -f deploy/v2beta1/mpi-operator.yaml || true
 	@minikube -p ${PROFILE} image load ${IMAGE_NAME}:${RELEASE_VERSION}
+
+load-kind:
+	@kubectl --context kind-${PROFILE} -n ${NAMESPACE} delete -f deploy/v2beta1/mpi-operator.yaml || true
+	@kind load docker-image ${IMAGE_NAME}:${RELEASE_VERSION} --name ${PROFILE}
 
 test-k8s:
 	@date
